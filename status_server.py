@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-"""status_server.py — Lightweight status/instructions page for the tunnel app.
+"""status_server.py — Status page + tunnel proxy for the OpenHost tunnel app.
 
-Listens on 127.0.0.1:3000. When no chisel client has connected a reverse
-tunnel, this serves the status page with connection instructions. When a
-client connects and tunnels their local port to 3000, chisel replaces this
-server's traffic with the tunneled app.
-
-Note: chisel's reverse tunnel binding *replaces* the backend for the
-tunneled port. So when a client does `R:3000:localhost:8080`, chisel
-stops forwarding port 3000 to this status server and instead forwards
-it to the client's local port 8080. When the client disconnects, chisel
-resumes forwarding to this status server.
+Listens on 127.0.0.1:3000. For each request, checks if the tunnel port
+(default 3001) is responding. If yes, proxies the request there (the
+user's local app). If no, serves a status page with connection instructions.
 """
 
+import http.client
 import os
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 3000
-
+TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "3001"))
 TUNNEL_URL = os.environ.get("TUNNEL_URL", "https://tunnel.localhost")
 AUTH_CREDS = os.environ.get("AUTH_CREDS", "tunnel:changeme")
 
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+def _tunnel_alive():
+    """Check if something is listening on the tunnel port."""
+    try:
+        with socket.create_connection(("127.0.0.1", TUNNEL_PORT), timeout=0.5):
+            return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+STATUS_HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -41,9 +45,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>OpenHost Tunnel</h1>
-<div class="status waiting">
-  No tunnel client connected. Follow the instructions below to expose your local app.
-</div>
+<div class="status waiting">No tunnel client connected.</div>
 
 <h2>Quick Start</h2>
 <p>1. Install chisel on your local machine:</p>
@@ -51,55 +53,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 # macOS
 brew install chisel
 
-# Linux (download binary)
-curl -sL https://github.com/jpillora/chisel/releases/latest/download/chisel_linux_amd64.gz | gunzip > chisel
-chmod +x chisel
-sudo mv chisel /usr/local/bin/
+# Linux
+curl -sL https://i.jpillora.com/chisel! | bash
 
 # Or with Go
 go install github.com/jpillora/chisel@latest
 </pre>
 
-<p>2. Run the chisel client to tunnel your local app (e.g. running on port 3000):</p>
-<pre>chisel client --auth {auth_creds} {tunnel_url} R:3000:localhost:3000</pre>
+<p>2. Run the chisel client (replace <code>3000</code> with your local app's port):</p>
+<pre>chisel client --auth {auth_creds} {tunnel_url} R:3001:localhost:3000</pre>
 
-<p>Replace the second <code>3000</code> with whatever port your local app listens on.</p>
-
-<p>3. Your local app is now accessible at:</p>
-<pre>{tunnel_url}</pre>
-
-<h2>How It Works</h2>
-<p>The chisel client on your machine opens an outbound WebSocket connection to this
-server (NAT/firewall friendly). Your local HTTP traffic is then forwarded through
-this tunnel and served at the OpenHost URL above.</p>
-
-<h2>Notes</h2>
-<ul>
-  <li>The tunnel URL is protected by OpenHost zone auth by default.
-      Public access can be configured via <code>public_paths</code>.</li>
-  <li>The connection is encrypted (SSH over WebSocket).</li>
-  <li>Keep the chisel client running to maintain the tunnel.</li>
-</ul>
+<p>3. Your local app is now accessible at: <a href="{tunnel_url}">{tunnel_url}</a></p>
 </body>
 </html>
 """
 
 
-class StatusHandler(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def do_GET(self):
-        if self.path == "/healthz":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-            return
-
-        body = HTML_TEMPLATE.format(
-            tunnel_url=TUNNEL_URL,
-            auth_creds=AUTH_CREDS,
+    def _serve_status(self):
+        body = STATUS_HTML.format(
+            tunnel_url=TUNNEL_URL, auth_creds=AUTH_CREDS,
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -107,12 +83,57 @@ class StatusHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+    def _proxy_to_tunnel(self, body=None):
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", TUNNEL_PORT, timeout=30)
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ("host", "connection", "transfer-encoding")}
+            conn.request(self.command, self.path, body=body, headers=headers)
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            self.send_response_only(resp.status, resp.reason)
+            for k, v in resp.getheaders():
+                if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                    self.send_header(k, v)
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(resp_body)
+            conn.close()
+        except Exception:
+            self._serve_status()
+
+    def _handle(self):
+        if self.path == "/healthz":
+            connected = _tunnel_alive()
+            body = f'{{"status":"ok","tunnel_connected":{str(connected).lower()}}}'.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if _tunnel_alive():
+            body = None
+            if self.command in ("POST", "PUT", "PATCH"):
+                cl = self.headers.get("Content-Length")
+                if cl:
+                    body = self.rfile.read(int(cl))
+            self._proxy_to_tunnel(body)
+        else:
+            self._serve_status()
+
+    def do_GET(self): self._handle()
+    def do_POST(self): self._handle()
+    def do_PUT(self): self._handle()
+    def do_PATCH(self): self._handle()
+    def do_DELETE(self): self._handle()
+    def do_HEAD(self): self._handle()
+    def do_OPTIONS(self): self._handle()
 
 
 if __name__ == "__main__":
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), StatusHandler)
-    print(f"[status] Listening on {LISTEN_HOST}:{LISTEN_PORT}", flush=True)
+    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    print(f"[status] Listening on {LISTEN_HOST}:{LISTEN_PORT}, tunnel port {TUNNEL_PORT}", flush=True)
     server.serve_forever()

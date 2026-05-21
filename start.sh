@@ -2,23 +2,23 @@
 # start.sh — OpenHost tunnel supervisor.
 #
 # Runs two processes:
-#   1. Chisel server (reverse tunnel, port 8080)
-#   2. Status page server (port 3000, used as chisel --backend)
+#   1. Chisel server (port 8080, with --backend proxying to status/tunnel proxy)
+#   2. Status/proxy server (port 3000, proxies to tunnel port 3001 when active)
 #
-# When no tunnel client is connected, visitors see a status/instructions page.
-# When a client connects with `chisel client ... R:3000:localhost:<local_port>`,
-# the client's local app replaces the status page on the same URL.
+# Client connects with: chisel client --auth <creds> <url> R:3001:localhost:<local_port>
+# When connected, tunnel.example.com serves the local app.
+# When disconnected, it shows the status/instructions page.
 
 set -eu
 
 APP_DATA_DIR="${OPENHOST_APP_DATA_DIR:-/data/app_data/tunnel}"
-AUTH_FILE="${APP_DATA_DIR}/.chisel-auth"
 ZONE_DOMAIN="${OPENHOST_ZONE_DOMAIN:-localhost}"
 APP_NAME="${OPENHOST_APP_NAME:-tunnel}"
 
 mkdir -p "$APP_DATA_DIR"
 
 # Generate auth credentials on first boot
+AUTH_FILE="${APP_DATA_DIR}/.chisel-auth"
 if [ ! -f "$AUTH_FILE" ]; then
     USERNAME="tunnel"
     PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
@@ -31,20 +31,15 @@ AUTH_CREDS="$(cat "$AUTH_FILE")"
 echo "[start.sh] Tunnel auth: ${AUTH_CREDS}"
 echo "[start.sh] Connect URL: https://${APP_NAME}.${ZONE_DOMAIN}"
 
-# --- Start status page server ---
+# --- Start status/proxy server ---
 TUNNEL_URL="https://${APP_NAME}.${ZONE_DOMAIN}" \
   AUTH_CREDS="$AUTH_CREDS" \
+  TUNNEL_PORT=3001 \
   python3 /opt/openhost/status_server.py &
 STATUS_PID=$!
-
-# Wait for status server
 sleep 1
 
 # --- Start chisel server ---
-# --reverse: allow clients to open reverse tunnels
-# --backend: proxy normal HTTP to the status/tunneled app on port 3000
-# --auth: require credentials
-# --host 0.0.0.0 --port 8080: listen on the OpenHost-routed port
 echo "[start.sh] Starting chisel server..."
 chisel server \
     --reverse \
