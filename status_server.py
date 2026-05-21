@@ -84,6 +84,31 @@ def _load_allowed_users() -> set[str]:
         return {l.strip().lower() for l in f if l.strip() and not l.strip().startswith("#")}
 
 
+def _save_allowed_users(users: set[str]) -> None:
+    with open(ALLOWED_USERS_FILE, "w") as f:
+        for u in sorted(users):
+            f.write(u + "\n")
+
+
+def _add_allowed_user(identity: str) -> None:
+    users = _load_allowed_users()
+    users.add(identity.strip().lower())
+    _save_allowed_users(users)
+
+
+def _remove_allowed_user(identity: str) -> None:
+    users = _load_allowed_users()
+    users.discard(identity.strip().lower())
+    if users:
+        _save_allowed_users(users)
+    elif os.path.exists(ALLOWED_USERS_FILE):
+        os.remove(ALLOWED_USERS_FILE)
+
+
+def _is_owner(headers) -> bool:
+    return headers.get("X-OpenHost-Is-Owner", "").lower() == "true"
+
+
 def _sign_session(email: str) -> str:
     """Create a signed session value: email|expiry|signature."""
     expiry = str(int(time.time()) + SESSION_MAX_AGE)
@@ -255,9 +280,78 @@ ACCESS_DENIED_HTML = """<!DOCTYPE html>
 """
 
 
+ADMIN_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenHost Tunnel - Access Control</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 640px;
+         margin: 40px auto; padding: 0 20px; color: #333; line-height: 1.6; }}
+  h1 {{ color: #111; }}
+  .status {{ padding: 12px 16px; border-radius: 6px; margin: 20px 0; }}
+  .enabled {{ background: #d4edda; border: 1px solid #28a745; }}
+  .disabled {{ background: #f8f9fa; border: 1px solid #dee2e6; }}
+  .user-list {{ list-style: none; padding: 0; }}
+  .user-list li {{ display: flex; justify-content: space-between; align-items: center;
+                   padding: 8px 12px; border: 1px solid #dee2e6; margin: 4px 0;
+                   border-radius: 4px; background: #fff; }}
+  .user-list li form {{ margin: 0; }}
+  .add-form {{ display: flex; gap: 8px; margin: 16px 0; }}
+  .add-form input {{ flex: 1; padding: 8px 12px; border: 1px solid #ccc; border-radius: 4px; }}
+  button {{ padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
+  .btn-add {{ background: #28a745; color: white; }}
+  .btn-remove {{ background: #dc3545; color: white; font-size: 0.85em; padding: 4px 12px; }}
+  .btn-back {{ background: #6c757d; color: white; text-decoration: none;
+               display: inline-block; margin-top: 16px; }}
+  .empty {{ color: #888; font-style: italic; }}
+</style>
+</head>
+<body>
+<h1>Tunnel Access Control</h1>
+
+<div class="status {status_class}">
+  Auth is <strong>{auth_status}</strong>.
+  {status_detail}
+</div>
+
+<h2>Allowed Users</h2>
+<p>Add Google emails or GitHub usernames. Auth activates when at least one user is listed.</p>
+
+<form class="add-form" method="POST" action="/_tunnel/admin/add">
+  <input type="text" name="identity" placeholder="email@example.com or github-username" required>
+  <button type="submit" class="btn-add">Add</button>
+</form>
+
+{user_list_html}
+
+<a href="/" class="btn-back" style="padding: 8px 16px; border-radius: 4px;">Back to tunnel</a>
+</body>
+</html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
+
+    def _read_body(self) -> bytes | None:
+        cl = self.headers.get("Content-Length")
+        if cl:
+            try:
+                return self.rfile.read(int(cl))
+            except (ValueError, OSError):
+                return None
+        return None
+
+    def _send_json(self, code: int, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_html(self, code: int, html: str):
         body = html.encode()
@@ -279,6 +373,8 @@ class Handler(BaseHTTPRequestHandler):
         auth_notice = ""
         if _auth_enabled():
             auth_notice = '<div class="status info">Access control is enabled. Users must sign in with Google or GitHub.</div>'
+        if _is_owner(self.headers):
+            auth_notice += '<p><a href="/_tunnel/admin">Manage access control</a></p>'
         html = STATUS_HTML.format(
             tunnel_url=TUNNEL_URL, auth_creds=AUTH_CREDS, auth_notice=auth_notice,
         )
@@ -338,6 +434,94 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_html(500, f"<h1>OAuth error</h1><pre>{json.dumps(data, indent=2)}</pre>")
 
+    def _handle_admin(self):
+        """Render the access control admin page (owner-only)."""
+        if not _is_owner(self.headers):
+            self._send_html(403, "<h1>Forbidden</h1><p>Only the zone owner can manage access control.</p>")
+            return
+        users = sorted(_load_allowed_users())
+        if users:
+            items = "".join(
+                f'<li>{u} <form method="POST" action="/_tunnel/admin/remove">'
+                f'<input type="hidden" name="identity" value="{u}">'
+                f'<button type="submit" class="btn-remove">Remove</button></form></li>'
+                for u in users
+            )
+            user_list_html = f'<ul class="user-list">{items}</ul>'
+        else:
+            user_list_html = '<p class="empty">No users added. Auth is disabled.</p>'
+
+        enabled = _auth_enabled()
+        html = ADMIN_HTML.format(
+            status_class="enabled" if enabled else "disabled",
+            auth_status="enabled" if enabled else "disabled",
+            status_detail="Visitors must sign in." if enabled else "Add users below to enable.",
+            user_list_html=user_list_html,
+        )
+        self._send_html(200, html)
+
+    def _handle_admin_add(self):
+        """Add a user to the allowed list (owner-only)."""
+        if not _is_owner(self.headers):
+            self._send_html(403, "<h1>Forbidden</h1>")
+            return
+        body = self._read_body()
+        if not body:
+            self._redirect("/_tunnel/admin")
+            return
+        params = urllib.parse.parse_qs(body.decode())
+        identity = params.get("identity", [""])[0].strip()
+        if identity:
+            _add_allowed_user(identity)
+        self._redirect("/_tunnel/admin")
+
+    def _handle_admin_remove(self):
+        """Remove a user from the allowed list (owner-only)."""
+        if not _is_owner(self.headers):
+            self._send_html(403, "<h1>Forbidden</h1>")
+            return
+        body = self._read_body()
+        if not body:
+            self._redirect("/_tunnel/admin")
+            return
+        params = urllib.parse.parse_qs(body.decode())
+        identity = params.get("identity", [""])[0].strip()
+        if identity:
+            _remove_allowed_user(identity)
+        self._redirect("/_tunnel/admin")
+
+    def _handle_api_users(self):
+        """JSON API for managing allowed users (owner-only)."""
+        if not _is_owner(self.headers):
+            self._send_json(403, {"error": "forbidden"})
+            return
+        if self.command == "GET":
+            self._send_json(200, {"users": sorted(_load_allowed_users()), "auth_enabled": _auth_enabled()})
+        elif self.command == "POST":
+            body = self._read_body()
+            if not body:
+                self._send_json(400, {"error": "missing body"})
+                return
+            data = json.loads(body)
+            identity = data.get("identity", "").strip()
+            if not identity:
+                self._send_json(400, {"error": "identity required"})
+                return
+            _add_allowed_user(identity)
+            self._send_json(200, {"ok": True, "users": sorted(_load_allowed_users())})
+        elif self.command == "DELETE":
+            body = self._read_body()
+            if not body:
+                self._send_json(400, {"error": "missing body"})
+                return
+            data = json.loads(body)
+            identity = data.get("identity", "").strip()
+            if not identity:
+                self._send_json(400, {"error": "identity required"})
+                return
+            _remove_allowed_user(identity)
+            self._send_json(200, {"ok": True, "users": sorted(_load_allowed_users())})
+
     def _handle_callback(self):
         """Handle OAuth callback — fetch token, get user identity, set session."""
         qs = urllib.parse.urlparse(self.path).query
@@ -384,6 +568,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        # Admin endpoints (owner-only, gated by X-OpenHost-Is-Owner)
+        if path == "/_tunnel/admin":
+            self._handle_admin()
+            return
+        if path == "/_tunnel/admin/add":
+            self._handle_admin_add()
+            return
+        if path == "/_tunnel/admin/remove":
+            self._handle_admin_remove()
+            return
+        if path == "/_tunnel/api/users":
+            self._handle_api_users()
             return
 
         # Auth endpoints (always accessible)
