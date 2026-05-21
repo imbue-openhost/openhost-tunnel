@@ -1,6 +1,6 @@
 # Tunnel app for OpenHost — expose local web apps via Chisel reverse tunnel.
 
-FROM docker.io/library/golang:1.24-alpine AS chisel-build
+FROM docker.io/library/golang:1.25-alpine AS chisel-build
 RUN apk add --no-cache git
 RUN go install github.com/jpillora/chisel@latest
 
