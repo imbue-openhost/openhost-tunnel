@@ -369,12 +369,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+    def _require_owner(self) -> bool:
+        """Check X-OpenHost-Is-Owner. If not owner, redirect to zone login or return 401.
+
+        Returns True if the request should be blocked (caller should return early).
+        """
+        if _is_owner(self.headers):
+            return False
+        accept = self.headers.get("Accept", "")
+        if "text/html" in accept:
+            zone = self.headers.get("X-Forwarded-Host", "")
+            if zone:
+                bare = zone.split(".", 1)[1] if "." in zone else zone
+                self._redirect(f"https://{bare}/login")
+                return True
+        self._send_json(401, {"error": "owner session required"})
+        return True
+
     def _serve_status(self):
+        """Serve the status/instructions page. Owner-only (shows credentials)."""
+        if self._require_owner():
+            return
         auth_notice = ""
         if _auth_enabled():
             auth_notice = '<div class="status info">Access control is enabled. Users must sign in with Google or GitHub.</div>'
-        if _is_owner(self.headers):
-            auth_notice += '<p><a href="/_tunnel/admin">Manage access control</a></p>'
+        auth_notice += '<p><a href="/_tunnel/admin">Manage access control</a></p>'
         html = STATUS_HTML.format(
             tunnel_url=TUNNEL_URL, auth_creds=AUTH_CREDS, auth_notice=auth_notice,
         )
@@ -436,8 +455,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_admin(self):
         """Render the access control admin page (owner-only)."""
-        if not _is_owner(self.headers):
-            self._send_html(403, "<h1>Forbidden</h1><p>Only the zone owner can manage access control.</p>")
+        if self._require_owner():
             return
         users = sorted(_load_allowed_users())
         if users:
@@ -462,8 +480,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_admin_add(self):
         """Add a user to the allowed list (owner-only)."""
-        if not _is_owner(self.headers):
-            self._send_html(403, "<h1>Forbidden</h1>")
+        if self._require_owner():
             return
         body = self._read_body()
         if not body:
@@ -477,8 +494,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_admin_remove(self):
         """Remove a user from the allowed list (owner-only)."""
-        if not _is_owner(self.headers):
-            self._send_html(403, "<h1>Forbidden</h1>")
+        if self._require_owner():
             return
         body = self._read_body()
         if not body:
@@ -492,8 +508,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api_users(self):
         """JSON API for managing allowed users (owner-only)."""
-        if not _is_owner(self.headers):
-            self._send_json(403, {"error": "forbidden"})
+        if self._require_owner():
             return
         if self.command == "GET":
             self._send_json(200, {"users": sorted(_load_allowed_users()), "auth_enabled": _auth_enabled()})
@@ -598,10 +613,18 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_callback()
             return
 
-        # Auth check
-        if not self._check_auth():
-            self._redirect("/_tunnel/login")
-            return
+        # Access control for tunneled content:
+        # - Owner always has access (X-OpenHost-Is-Owner)
+        # - When OAuth auth enabled: allowed users with valid session get access
+        # - When no auth: only owner
+        if not _is_owner(self.headers):
+            if _auth_enabled():
+                if not self._check_auth():
+                    self._redirect("/_tunnel/login")
+                    return
+            else:
+                if self._require_owner():
+                    return
 
         # Proxy or status page
         if _tunnel_alive():
