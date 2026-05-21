@@ -1,14 +1,35 @@
 #!/usr/bin/env python3
-"""status_server.py — Status page + tunnel proxy for the OpenHost tunnel app.
+"""status_server.py — Status page + tunnel proxy + optional OAuth access control.
 
-Listens on 127.0.0.1:3000. For each request, checks if the tunnel port
-(default 3001) is responding. If yes, proxies the request there (the
-user's local app). If no, serves a status page with connection instructions.
+Listens on 127.0.0.1:3000. For each request:
+  1. If auth is enabled (allowed-users.txt exists), check session cookie
+  2. If tunnel port (3001) is responding, proxy to it
+  3. Otherwise show status page with connection instructions
+
+Auth flow (when enabled):
+  - Visitor hits any page → no session cookie → redirect to /_tunnel/login
+  - /_tunnel/login → call OpenHost OAuth service for a Google token
+  - OAuth service returns 401 with authorize_url → redirect user there
+  - User authenticates with Google → redirected back to /_tunnel/callback
+  - We fetch user's email from Google userinfo API
+  - Check email against allowed-users.txt
+  - If allowed, set signed session cookie → redirect to original URL
+  - If not allowed, show "access denied"
 """
 
+from __future__ import annotations
+
+import hashlib
+import hmac
 import http.client
+import json
 import os
+import secrets
 import socket
+import ssl
+import time
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 LISTEN_HOST = "127.0.0.1"
@@ -17,15 +38,140 @@ TUNNEL_PORT = int(os.environ.get("TUNNEL_PORT", "3001"))
 TUNNEL_URL = os.environ.get("TUNNEL_URL", "https://tunnel.localhost")
 AUTH_CREDS = os.environ.get("AUTH_CREDS", "tunnel:changeme")
 
+# OpenHost service integration
+ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "")
+APP_TOKEN = os.environ.get("OPENHOST_APP_TOKEN", "")
+ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
+APP_NAME = os.environ.get("OPENHOST_APP_NAME", "tunnel")
+APP_DATA_DIR = os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/tunnel")
 
-def _tunnel_alive():
-    """Check if something is listening on the tunnel port."""
+ALLOWED_USERS_FILE = os.path.join(APP_DATA_DIR, "allowed-users.txt")
+SESSION_COOKIE = "tunnel_session"
+SESSION_MAX_AGE = 7 * 24 * 3600  # 1 week
+
+# Signing key for session cookies (generated once at startup)
+_COOKIE_SECRET = os.environ.get("COOKIE_SECRET", "")
+
+
+def _get_cookie_secret() -> str:
+    global _COOKIE_SECRET
+    if not _COOKIE_SECRET:
+        secret_path = os.path.join(APP_DATA_DIR, ".cookie-secret")
+        if os.path.exists(secret_path):
+            with open(secret_path) as f:
+                _COOKIE_SECRET = f.read().strip()
+        else:
+            _COOKIE_SECRET = secrets.token_hex(32)
+            with open(secret_path, "w") as f:
+                f.write(_COOKIE_SECRET)
+            os.chmod(secret_path, 0o600)
+    return _COOKIE_SECRET
+
+
+def _auth_enabled() -> bool:
+    """Auth is enabled when allowed-users.txt exists and is non-empty."""
+    if not os.path.exists(ALLOWED_USERS_FILE):
+        return False
+    with open(ALLOWED_USERS_FILE) as f:
+        lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+    return len(lines) > 0
+
+
+def _load_allowed_users() -> set[str]:
+    if not os.path.exists(ALLOWED_USERS_FILE):
+        return set()
+    with open(ALLOWED_USERS_FILE) as f:
+        return {l.strip().lower() for l in f if l.strip() and not l.strip().startswith("#")}
+
+
+def _sign_session(email: str) -> str:
+    """Create a signed session value: email|expiry|signature."""
+    expiry = str(int(time.time()) + SESSION_MAX_AGE)
+    payload = f"{email}|{expiry}"
+    sig = hmac.new(_get_cookie_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}|{sig}"
+
+
+def _verify_session(cookie: str) -> str | None:
+    """Verify a session cookie. Returns email if valid, None otherwise."""
+    parts = cookie.split("|")
+    if len(parts) != 3:
+        return None
+    email, expiry, sig = parts
+    payload = f"{email}|{expiry}"
+    expected = hmac.new(_get_cookie_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    if int(expiry) < int(time.time()):
+        return None
+    return email
+
+
+def _tunnel_alive() -> bool:
     try:
         with socket.create_connection(("127.0.0.1", TUNNEL_PORT), timeout=0.5):
             return True
     except (ConnectionRefusedError, OSError):
         return False
 
+
+def _parse_cookies(header: str) -> dict[str, str]:
+    cookies = {}
+    if not header:
+        return cookies
+    for part in header.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
+def _oauth_service_call(endpoint: str, payload: dict) -> tuple[int, dict]:
+    """Call the OpenHost OAuth service via the router."""
+    url = f"{ROUTER_URL}/api/services/v2/call/oauth/{endpoint}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {APP_TOKEN}")
+    req.add_header("Content-Type", "application/json")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def _fetch_google_email(access_token: str) -> str | None:
+    """Fetch the user's email from Google's userinfo endpoint."""
+    req = urllib.request.Request("https://www.googleapis.com/oauth2/v2/userinfo")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+            return data.get("email")
+    except Exception:
+        return None
+
+
+def _fetch_github_username(access_token: str) -> str | None:
+    """Fetch the user's login from GitHub's user endpoint."""
+    req = urllib.request.Request("https://api.github.com/user")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("User-Agent", "openhost-tunnel")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read())
+            return data.get("login")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# HTML templates
+# ---------------------------------------------------------------------------
 
 STATUS_HTML = """<!DOCTYPE html>
 <html>
@@ -41,12 +187,13 @@ STATUS_HTML = """<!DOCTYPE html>
   pre {{ background: #f4f4f4; padding: 16px; border-radius: 6px; overflow-x: auto; }}
   .status {{ padding: 12px 16px; border-radius: 6px; margin: 20px 0; }}
   .waiting {{ background: #fff3cd; border: 1px solid #ffc107; }}
+  .info {{ background: #d1ecf1; border: 1px solid #0dcaf0; }}
 </style>
 </head>
 <body>
 <h1>OpenHost Tunnel</h1>
 <div class="status waiting">No tunnel client connected.</div>
-
+{auth_notice}
 <h2>Quick Start</h2>
 <p>1. Install chisel on your local machine:</p>
 <pre>
@@ -55,15 +202,54 @@ brew install chisel
 
 # Linux
 curl -sL https://i.jpillora.com/chisel! | bash
-
-# Or with Go
-go install github.com/jpillora/chisel@latest
 </pre>
-
 <p>2. Run the chisel client (replace <code>3000</code> with your local app's port):</p>
 <pre>chisel client --auth {auth_creds} {tunnel_url} R:3001:localhost:3000</pre>
-
 <p>3. Your local app is now accessible at: <a href="{tunnel_url}">{tunnel_url}</a></p>
+</body>
+</html>
+"""
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"><title>OpenHost Tunnel - Login</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 400px;
+         margin: 80px auto; padding: 0 20px; text-align: center; }}
+  a.btn {{ display: inline-block; padding: 12px 24px; margin: 10px;
+           background: #4285f4; color: white; text-decoration: none;
+           border-radius: 6px; font-size: 1.1em; }}
+  a.btn.github {{ background: #333; }}
+</style>
+</head>
+<body>
+<h2>Sign in to access the tunnel</h2>
+<p>Choose a provider:</p>
+<a class="btn" href="/_tunnel/auth/google">Sign in with Google</a>
+<br>
+<a class="btn github" href="/_tunnel/auth/github">Sign in with GitHub</a>
+</body>
+</html>
+"""
+
+ACCESS_DENIED_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"><title>Access Denied</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; max-width: 400px;
+         margin: 80px auto; padding: 0 20px; text-align: center; }}
+  .denied {{ background: #f8d7da; border: 1px solid #f5c6cb; padding: 16px;
+             border-radius: 6px; margin: 20px 0; }}
+</style>
+</head>
+<body>
+<h2>Access Denied</h2>
+<div class="denied">
+  <p><strong>{identity}</strong> is not in the allowed users list.</p>
+  <p>Contact the tunnel owner to request access.</p>
+</div>
 </body>
 </html>
 """
@@ -73,15 +259,30 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _serve_status(self):
-        body = STATUS_HTML.format(
-            tunnel_url=TUNNEL_URL, auth_creds=AUTH_CREDS,
-        ).encode()
-        self.send_response(200)
+    def _send_html(self, code: int, html: str):
+        body = html.encode()
+        self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, url: str, cookie: str | None = None):
+        self.send_response(302)
+        self.send_header("Location", url)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _serve_status(self):
+        auth_notice = ""
+        if _auth_enabled():
+            auth_notice = '<div class="status info">Access control is enabled. Users must sign in with Google or GitHub.</div>'
+        html = STATUS_HTML.format(
+            tunnel_url=TUNNEL_URL, auth_creds=AUTH_CREDS, auth_notice=auth_notice,
+        )
+        self._send_html(200, html)
 
     def _proxy_to_tunnel(self, body=None):
         try:
@@ -103,8 +304,79 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._serve_status()
 
+    def _check_auth(self) -> bool:
+        """Check if the request is authenticated. Returns True if ok to proceed."""
+        if not _auth_enabled():
+            return True
+        cookies = _parse_cookies(self.headers.get("Cookie", ""))
+        session = cookies.get(SESSION_COOKIE, "")
+        email = _verify_session(session)
+        if email and email.lower() in _load_allowed_users():
+            return True
+        return False
+
+    def _handle_tunnel_auth(self, provider: str):
+        """Start OAuth flow for the given provider."""
+        return_to = f"//{APP_NAME}.{ZONE_DOMAIN}/_tunnel/callback?provider={provider}"
+        scopes = ["openid", "email"] if provider == "google" else []
+        status, data = _oauth_service_call("token", {
+            "provider": provider,
+            "scopes": scopes,
+            "account": "NEW",
+            "return_to": return_to,
+        })
+        if status == 401 and "authorize_url" in data:
+            self._redirect(data["authorize_url"])
+        elif status == 403 and "required_grant" in data:
+            grant_url = data["required_grant"].get("grant_url", "")
+            if grant_url:
+                self._redirect(grant_url)
+            else:
+                self._send_html(500, "<h1>OAuth permission not granted</h1>")
+        elif status == 503:
+            self._send_html(503, "<h1>OAuth provider not configured</h1><p>The zone owner needs to configure OAuth credentials.</p>")
+        else:
+            self._send_html(500, f"<h1>OAuth error</h1><pre>{json.dumps(data, indent=2)}</pre>")
+
+    def _handle_callback(self):
+        """Handle OAuth callback — fetch token, get user identity, set session."""
+        qs = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(qs)
+        provider = params.get("provider", ["google"])[0]
+
+        scopes = ["openid", "email"] if provider == "google" else []
+        status, data = _oauth_service_call("token", {
+            "provider": provider,
+            "scopes": scopes,
+            "account": "default",
+        })
+        if status != 200 or "access_token" not in data:
+            self._send_html(500, f"<h1>Failed to get token</h1><pre>{json.dumps(data, indent=2)}</pre>")
+            return
+
+        token = data["access_token"]
+        if provider == "google":
+            identity = _fetch_google_email(token)
+        else:
+            identity = _fetch_github_username(token)
+
+        if not identity:
+            self._send_html(500, "<h1>Failed to fetch user identity</h1>")
+            return
+
+        allowed = _load_allowed_users()
+        if identity.lower() not in allowed:
+            self._send_html(403, ACCESS_DENIED_HTML.format(identity=identity))
+            return
+
+        session_value = _sign_session(identity.lower())
+        cookie = f"{SESSION_COOKIE}={session_value}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age={SESSION_MAX_AGE}"
+        self._redirect("/", cookie)
+
     def _handle(self):
-        if self.path == "/healthz":
+        path = self.path.split("?")[0]
+
+        if path == "/healthz":
             connected = _tunnel_alive()
             body = f'{{"status":"ok","tunnel_connected":{str(connected).lower()}}}'.encode()
             self.send_response(200)
@@ -114,6 +386,26 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # Auth endpoints (always accessible)
+        if path == "/_tunnel/login":
+            self._send_html(200, LOGIN_HTML)
+            return
+        if path == "/_tunnel/auth/google":
+            self._handle_tunnel_auth("google")
+            return
+        if path == "/_tunnel/auth/github":
+            self._handle_tunnel_auth("github")
+            return
+        if path == "/_tunnel/callback":
+            self._handle_callback()
+            return
+
+        # Auth check
+        if not self._check_auth():
+            self._redirect("/_tunnel/login")
+            return
+
+        # Proxy or status page
         if _tunnel_alive():
             body = None
             if self.command in ("POST", "PUT", "PATCH"):
@@ -134,6 +426,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    _get_cookie_secret()  # Initialize on startup
+    auth_status = "enabled" if _auth_enabled() else "disabled (no allowed-users.txt)"
     print(f"[status] Listening on {LISTEN_HOST}:{LISTEN_PORT}, tunnel port {TUNNEL_PORT}", flush=True)
+    print(f"[status] Auth: {auth_status}", flush=True)
+    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     server.serve_forever()

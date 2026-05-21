@@ -1,7 +1,7 @@
 [app]
 name = "tunnel"
-version = "0.1.0"
-description = "Expose a local web application through your OpenHost instance via Chisel reverse tunnel."
+version = "0.2.0"
+description = "Expose a local web application through your OpenHost instance via Chisel reverse tunnel, with optional multi-user OAuth access control."
 authors = ["Andrew Laack <andrew@laack.co>"]
 
 [runtime.container]
@@ -18,3 +18,12 @@ cpu_millicores = 200
 
 [data]
 app_data = true
+
+[[services.v2.consumes]]
+service = "github.com/imbue-openhost/openhost/services/oauth"
+shortname = "oauth"
+version = ">=0.1.0"
+grants = [
+    {provider = "google", scopes = ["openid", "email"]},
+    {provider = "github", scopes = []},
+]
